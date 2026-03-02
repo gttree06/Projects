@@ -157,8 +157,67 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-def score_record(card_text: str, user: dict) -> int:
-    """Score a record card against user data. Higher = better match."""
+def scroll_to_load_all(driver: webdriver.Chrome):
+    """
+    Scroll the page in chunks to trigger lazy-loaded content,
+    repeating until no new content appears.
+    """
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    while True:
+        # Scroll down in small steps so lazy-load triggers fire
+        for _ in range(8):
+            driver.execute_script("window.scrollBy(0, 500);")
+            time.sleep(0.25)
+        time.sleep(1.0)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+    # Scroll back to top so selectors work from the beginning
+    driver.execute_script("window.scrollTo(0, 0);")
+    time.sleep(0.5)
+
+
+def build_address_tokens(addresses: list) -> list:
+    """
+    Break each address into meaningful tokens for matching.
+    e.g. "142 Newcastle Dr Jupiter, FL 33458"
+      -> ["142 newcastle dr jupiter", "fl", "33458",
+          "142 newcastle", "newcastle dr", "jupiter"]
+    This is more flexible than splitting only on commas.
+    """
+    tokens = set()
+    for addr in addresses:
+        n = normalize(addr)
+        # Full address (no zip) as one token
+        parts = n.split(",")
+        for part in parts:
+            part = part.strip()
+            if part:
+                tokens.add(part)
+        # Also add individual words so partial street matches work
+        words = re.findall(r"[a-z0-9]+", n)
+        for word in words:
+            if len(word) > 2:   # skip tiny words like "dr", "st" alone
+                tokens.add(word)
+        # Bigrams (pairs of consecutive words) catch "newcastle dr", "lake butler" etc.
+        for i in range(len(words) - 1):
+            tokens.add(f"{words[i]} {words[i+1]}")
+    return list(tokens)
+
+
+def score_record(card_text: str, user: dict, addr_tokens: list) -> int:
+    """
+    Score a record card against user data.
+    Higher score = better match.
+
+    Scoring:
+      +10  full name found in card
+      +5   exact age match
+      +2   age ±1
+      +4   full address part (street, city, or zip section) matched
+      +2   individual address word or bigram matched
+    """
     score = 0
     text  = normalize(card_text)
     full_name = normalize(f"{user['first_name']} {user['last_name']}")
@@ -173,11 +232,11 @@ def score_record(card_text: str, user: dict) -> int:
             if str(user["age"] + delta) in text:
                 score += 2
 
-    for addr in user.get("addresses", []):
-        for token in normalize(addr).split(","):
-            token = token.strip()
-            if token and token in text:
-                score += 3
+    for token in addr_tokens:
+        if token in text:
+            # Longer tokens (full street / city sections) score higher
+            bonus = 4 if len(token) > 8 else 2
+            score += bonus
 
     return score
 
@@ -188,14 +247,15 @@ def score_record(card_text: str, user: dict) -> int:
 
 def find_matching_record_ids(driver: webdriver.Chrome, user: dict) -> list:
     """
-    Search the results page and return IDs of cards that match the user.
+    Search the results page and return IDs of ALL cards that match the user.
 
     Each card on peoplebyname shows:
         Record ID: 425234752
-        Harvey Knell
-        980 Singing Wood Dr
-        Arcadia, CA 91006
+        Stephanie Sobeck
+        142 Newcastle Dr
+        Jupiter, FL 33458
     We read "Record ID: XXXXXXXXX" text directly from the DOM.
+    The page is fully scrolled first so all lazy-loaded cards are present.
     """
     url = SEARCH_URL.format(
         last=user["last_name"].capitalize(),
@@ -204,6 +264,14 @@ def find_matching_record_ids(driver: webdriver.Chrome, user: dict) -> list:
     print(f"\n[1] Loading search results: {url}")
     driver.get(url)
     time.sleep(PAGE_DELAY)
+
+    # Scroll the entire page so all cards load into the DOM
+    print("   Scrolling page to load all records…")
+    scroll_to_load_all(driver)
+
+    # Pre-build address tokens once for efficiency
+    addr_tokens = build_address_tokens(user.get("addresses", []))
+    print(f"   Address tokens for matching: {addr_tokens}")
 
     matching_ids = []
     seen = set()
@@ -234,7 +302,7 @@ def find_matching_record_ids(driver: webdriver.Chrome, user: dict) -> list:
             continue
         seen.add(record_id)
 
-        s = score_record(card_text, user)
+        s = score_record(card_text, user, addr_tokens)
         preview = card_text.replace("\n", " ")[:90]
         print(f"   ID {record_id} | score={s} | {preview!r}")
 
